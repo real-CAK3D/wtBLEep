@@ -216,7 +216,10 @@ void setup() {
   respChar->addDescriptor(new BLE2902());
 
   BLECharacteristic *stat = svc->createCharacteristic(STAT_UUID, BLECharacteristic::PROPERTY_READ);
-  stat->setValue("{\"status\":0,\"battery\":100,\"op\":\"idle\",\"model\":\"wtBLEep-C5\"}");
+  // Ready (1), not Booting (0); report CC1101 presence + link ok (no link-code gate on the C5).
+  String st0 = String("{\"status\":1,\"battery\":100,\"op\":\"idle\",\"sd\":false,\"cc1101\":") +
+               (cc1101ok ? "true" : "false") + ",\"nfc\":false,\"link\":\"ok\",\"model\":\"wtBLEep-C5\"}";
+  stat->setValue(st0.c_str());
 
   svc->start();
   BLEAdvertising *adv = BLEDevice::getAdvertising();
@@ -440,6 +443,14 @@ void doTransmit(float mhz, const String &bits) {
 
 void loop() {
   pollSerialCommands();    // accept CMD: lines from a USB-CDC host
+  // Telemetry heartbeat for the app's Fleet Health view (every 3s):
+  // DATA:HEALTH:<heapFree>,<uptimeSec>,<sd>,<cc1101>,<nfc>,<link>,<batt>.
+  static uint32_t lastHealthMs = 0;
+  if (millis() - lastHealthMs > 3000) {
+    lastHealthMs = millis();
+    notifyLine("DATA:HEALTH:" + String(ESP.getFreeHeap()) + "," + String(millis() / 1000) +
+               ",0," + String(cc1101ok ? 1 : 0) + ",0,ok,100\n");
+  }
 #if ALLOW_TX
   if (txPending) { txPending = false; doTransmit(txFreq, txBits); }
 #endif
