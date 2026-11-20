@@ -230,29 +230,34 @@ void setup() {
 }
 
 // ---- Job 1: Wi-Fi ----------------------------------------------------------
-// The C5 is SINGLE-CORE, so a blocking dual-band WiFi scan (several seconds)
-// starves the BLE host task and the phone's link times out mid-sweep — the
-// board "connects then disappears". Run the scan ASYNC and poll it with short
-// delay()s so the RTOS keeps servicing BLE the whole time the radio is busy.
+// The C5 is SINGLE-CORE with ONE radio shared by WiFi + BLE, and its async
+// scan-complete event never fires on core 3.3.12 — scanComplete() stays
+// WIFI_SCAN_RUNNING forever, so the old async sweep produced nothing. A full
+// blocking scan also monopolises the radio for seconds and the phone's link
+// times out mid-sweep ("connects then disappears"). Fix: scan ONE channel at a
+// time (short dwell), stream that channel's APs, then yield the radio to BLE
+// between channels — a full 2.4 + 5 GHz sweep that keeps the link alive.
 void wifiScanBroadcast() {
-  WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/true);
-  uint32_t t0 = millis();
-  while (WiFi.scanComplete() == WIFI_SCAN_RUNNING) {
-    delay(30);                      // yields to the BLE/RTOS tasks — keeps the link alive
-    if (millis() - t0 > 15000) { WiFi.scanDelete(); return; }  // safety cap
+  static const uint8_t CHANS[] = {
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,           // 2.4 GHz
+    36, 40, 44, 48, 149, 153, 157, 161, 165,             // 5 GHz UNII-1/3
+  };
+  int total = 0;
+  for (uint8_t ci = 0; ci < sizeof(CHANS) / sizeof(CHANS[0]); ci++) {
+    if (!(connected || serialActive) || !scanning) break;  // host (BLE/USB) dropped / stopped
+    int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/true,
+                              /*passive=*/false, /*max_ms_per_chan=*/110,
+                              /*channel=*/CHANS[ci]);
+    for (int i = 0; i < n && (connected || serialActive); i++) {
+      notifyLine("DATA:AP:" + WiFi.SSID(i) + "," + WiFi.BSSIDstr(i) + "," +
+                 String(WiFi.channel(i)) + "," + String(WiFi.RSSI(i)) + "," +
+                 authStr(WiFi.encryptionType(i)) + "\n");
+    }
+    if (n > 0) total += n;
+    WiFi.scanDelete();
+    delay(40);   // yield the radio to the BLE link between channels
   }
-  int n = WiFi.scanComplete();
-  if (n < 0) { WiFi.scanDelete(); return; }
-  for (int i = 0; i < n; i++) {
-    if (!connected) break;          // bail out the moment the phone drops
-    String ssid = WiFi.SSID(i);
-    String line = "DATA:AP:" + ssid + "," + WiFi.BSSIDstr(i) + "," +
-                  String(WiFi.channel(i)) + "," + String(WiFi.RSSI(i)) + "," +
-                  authStr(WiFi.encryptionType(i)) + "\n";
-    notifyLine(line);
-  }
-  Serial.printf("[ble] sent %d APs\n", n);
-  WiFi.scanDelete();
+  Serial.printf("[ble] sent %d APs\n", total);
 }
 
 // ---- Job 2: sub-GHz RSSI sweep (normal RX mode) ----------------------------
@@ -445,8 +450,11 @@ void loop() {
   pollSerialCommands();    // accept CMD: lines from a USB-CDC host
   // Telemetry heartbeat for the app's Fleet Health view (every 3s):
   // DATA:HEALTH:<heapFree>,<uptimeSec>,<sd>,<cc1101>,<nfc>,<link>,<batt>.
+  // Heartbeat ONLY while idle. On the single-radio C5 a BLE notify issued
+  // mid-scan breaks WiFi/BLE coexistence and the scan returns nothing — the
+  // exact regression the telemetry heartbeat introduced.
   static uint32_t lastHealthMs = 0;
-  if (millis() - lastHealthMs > 3000) {
+  if (!scanning && millis() - lastHealthMs > 3000) {
     lastHealthMs = millis();
     notifyLine("DATA:HEALTH:" + String(ESP.getFreeHeap()) + "," + String(millis() / 1000) +
                ",0," + String(cc1101ok ? 1 : 0) + ",0,ok,100\n");
